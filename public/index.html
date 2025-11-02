@@ -157,5 +157,119 @@
 
 <script>window.__BUILD_SHA__="dev";</script>
 <script src="./app.js?v=1"></script>
+
+<!-- 覆盖旧事件逻辑：去掉“必须 token”，并做输入记忆 -->
+<script>
+(function () {
+  // --- 工具：安全存取 localStorage
+  const LS = {
+    get: (k, d='') => { try { return localStorage.getItem(k) ?? d; } catch(e){ return d; } },
+    set: (k, v)   => { try { localStorage.setItem(k, v); } catch(e){} }
+  };
+
+  // --- 取 DOM（容错多种写法）
+  const $ = (sel) => document.querySelector(sel);
+  const rawUrl   = $('#rawUrl');
+  const rawToken = $('#rawToken');
+  const pubUrl   = $('#pubUrl');
+  const pubToken = $('#pubToken');
+
+  const btnRawConnect = $('#btnRawConnect');
+  const btnPubConnect = $('#btnPubConnect');
+
+  // --- 恢复输入
+  window.addEventListener('DOMContentLoaded', () => {
+    if (rawUrl)   rawUrl.value   = LS.get('tt_raw_wss_url', rawUrl.value || '');
+    if (rawToken) rawToken.value = LS.get('tt_raw_token', rawToken.value || '');
+    if (pubUrl)   pubUrl.value   = LS.get('tt_pub_wss_url', pubUrl.value || '');
+    if (pubToken) pubToken.value = LS.get('tt_pub_token', pubToken.value || '');
+  });
+
+  // --- 变更即保存
+  [['input','change','blur']].flat().forEach(ev=>{
+    rawUrl?.addEventListener(ev,   ()=>LS.set('tt_raw_wss_url', (rawUrl.value||'').trim()));
+    rawToken?.addEventListener(ev, ()=>LS.set('tt_raw_token',   (rawToken.value||'').trim()));
+    pubUrl?.addEventListener(ev,   ()=>LS.set('tt_pub_wss_url', (pubUrl.value||'').trim()));
+    pubToken?.addEventListener(ev, ()=>LS.set('tt_pub_token',   (pubToken.value||'').trim()));
+  });
+
+  // --- 替换按钮节点以清空旧的 click 监听（避免和旧脚本冲突）
+  function rehookButton(btn, handler) {
+    if (!btn) return null;
+    const clone = btn.cloneNode(true);
+    btn.parentNode.replaceChild(clone, btn);
+    clone.addEventListener('click', handler);
+    return clone;
+  }
+
+  // --- 规范化 WSS（允许只填 host/path）
+  function normalizeWss(raw) {
+    if (!raw) return '';
+    try {
+      const u = raw.startsWith('ws') ? new URL(raw)
+        : new URL(`wss://${raw.replace(/^\/+/, '')}`);
+      return u.toString();
+    } catch(e) {
+      return raw.trim(); // 交给底层报错
+    }
+  }
+
+  // --- 连接原始流（只要求 URL；token 可选 -> ?token=）
+  rehookButton(btnRawConnect, () => {
+    const raw = (rawUrl?.value || '').trim();
+    if (!raw) { alert('请填写 原始 WSS URL'); rawUrl?.focus(); return; }
+
+    let finalUrl = normalizeWss(raw);
+    const t = (rawToken?.value || '').trim();
+    try {
+      const u = new URL(finalUrl);
+      if (t) u.searchParams.set('token', t);
+      finalUrl = u.toString();
+    } catch(e) {}
+
+    // 记忆
+    LS.set('tt_raw_wss_url', raw);
+    if (t) LS.set('tt_raw_token', t);
+
+    // 调你现有的函数；没有就直接 new WebSocket
+    if (typeof window.connectSource === 'function') {
+      window.connectSource(finalUrl);
+    } else {
+      window.srcWS && window.srcWS.close?.();
+      window.srcWS = new WebSocket(finalUrl);
+    }
+  });
+
+  // --- 连接发布端点（只要求 URL；token 可选 -> ?token=）
+  rehookButton(btnPubConnect, () => {
+    const raw = (pubUrl?.value || '').trim();
+    if (!raw) { alert('请填写 发布 WSS URL'); pubUrl?.focus(); return; }
+
+    let finalUrl = normalizeWss(raw);
+    const t = (pubToken?.value || '').trim();
+    try {
+      const u = new URL(finalUrl);
+      if (t) u.searchParams.set('token', t);
+      finalUrl = u.toString();
+    } catch(e) {}
+
+    // 记忆
+    LS.set('tt_pub_wss_url', raw);
+    if (t) LS.set('tt_pub_token', t);
+
+    if (typeof window.connectPublisher === 'function') {
+      window.connectPublisher(finalUrl);
+    } else {
+      window.pubWS && window.pubWS.close?.();
+      window.pubWS = new WebSocket(finalUrl);
+    }
+  });
+
+  // 可选：把构建信息写到右上角
+  const bi = document.getElementById('buildInfo');
+  if (bi) bi.textContent = (window.__BUILD_SHA__ || 'dev');
+
+})();
+</script>
 </body>
 </html>
