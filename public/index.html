@@ -1,53 +1,195 @@
-<!-- 覆盖旧事件逻辑：去掉“必须 token”，并做输入记忆（固定弹框问题） -->
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>F端 · 中转与发布（全WSS）</title>
+  <link rel="stylesheet" href="./styles.css?v=2" />
+</head>
+<body>
+<header class="topbar">
+  <h1>F端 · 中转与发布</h1>
+  <div class="status">
+    <span>原始流：</span><span id="rawDot" class="dot gray"></span><span id="rawText">未连接</span>
+    <span class="gap"></span>
+    <span>发布：</span><span id="pubDot" class="dot gray"></span><span id="pubText">未连接</span>
+    <span class="gap"></span>
+    <small id="buildInfo"></small>
+  </div>
+</header>
+
+<main class="container">
+  <!-- 原始流连接（Server → F） -->
+  <section class="card">
+    <h2>原始流连接（Server → F）</h2>
+    <div class="grid">
+      <label>原始 WSS URL
+        <input id="rawUrl" type="text" placeholder="wss://46.151.33.170/ws" />
+      </label>
+      <label>Token（可选）
+        <input id="rawToken" type="text" placeholder="例如 token=xxx 或留空" />
+      </label>
+      <div class="row">
+        <button id="btnRawConnect" class="primary">连接原始流</button>
+        <button id="btnRawClose">断开</button>
+        <button id="btnToggleMock">切换 Mock（离线演示）</button>
+        <span id="mockBadge" class="badge">Mock: OFF</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 发布连接（F → /ws → A） -->
+  <section class="card">
+    <h2>发布连接（F → feed.youdatan.com/ws → A端）</h2>
+    <div class="grid">
+      <label>发布 WSS URL
+        <input id="pubUrl" type="text" placeholder="wss://feed.youdatan.com/ws" />
+      </label>
+      <label>PUBLISH_TOKEN（可选）
+        <input id="pubToken" type="text" placeholder="仅发布者需要（现在可留空）" />
+      </label>
+      <div class="row">
+        <button id="btnPubConnect" class="primary">连接发布端点</button>
+        <button id="btnPubClose">断开</button>
+        <button id="btnPublishSnap">发布 Snapshot（全量）</button>
+        <button id="btnPublishBeat">发送 Heartbeat</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- 映射（CSV） -->
+  <section class="card">
+    <h2>映射（CSV，加载后用于汉化）</h2>
+    <div class="grid g3">
+      <label>bookmakers.csv
+        <input id="m_book" type="text" placeholder="/mappings/id/bookmakers.csv" />
+      </label>
+      <label>leagues.csv
+        <input id="m_league" type="text" placeholder="/mappings/id/leagues.csv" />
+      </label>
+      <label>teams.csv
+        <input id="m_team" type="text" placeholder="/mappings/id/teams.csv" />
+      </label>
+      <label>leagues_en2cn.csv
+        <input id="m_league_en" type="text" placeholder="/mappings/en/leagues_en2cn.csv" />
+      </label>
+      <label>teams_en2cn.csv
+        <input id="m_team_en" type="text" placeholder="/mappings/en/teams_en2cn.csv" />
+      </label>
+      <div class="row">
+        <button id="btnLoadMaps">加载/刷新映射</button>
+        <span id="mapStatus" class="muted">未加载</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 上表：原始数据 -->
+  <section class="card">
+    <h2>上表：原始数据（按 source 分 Tab）</h2>
+    <div class="tabs">
+      <button class="tab active" data-tab="all">全部(<span id="rawCount">0</span>)</button>
+      <button class="tab" data-tab="isp">ISP</button>
+      <button class="tab" data-tab="pm">PM</button>
+    </div>
+    <div class="table-wrap">
+      <table id="rawTable"><thead></thead><tbody></tbody></table>
+    </div>
+    <div class="row">
+      <button id="btnAllToPublish">将当前 Tab 全部加入下表候选</button>
+      <button id="btnClearRaw">清空原始</button>
+    </div>
+  </section>
+
+  <!-- 下表：发布表（筛选/汉化/导出） -->
+  <section class="card">
+    <h2>下表：发布表（筛选/汉化/导出）</h2>
+    <div class="grid g3">
+      <label>源
+        <select id="f_source">
+          <option value="">全部</option>
+          <option value="isp">isp</option>
+          <option value="pm">pm</option>
+        </select>
+      </label>
+      <label>盘口
+        <select id="f_market">
+          <option value="">全部</option>
+          <option value="ou">ou</option>
+          <option value="ah">ah</option>
+          <option value="1x2">1x2</option>
+          <option value="corners">corners</option>
+        </select>
+      </label>
+      <label>Period
+        <select id="f_period">
+          <option value="">全部</option>
+          <option value="FT">FT</option>
+          <option value="HT">HT</option>
+        </select>
+      </label>
+    </div>
+    <div class="row">
+      <button id="btnApplyFilter">应用筛选</button>
+      <button id="btnClearFilter">清空筛选</button>
+      <button id="btnClearPublish">清空下表</button>
+      <button id="btnDownloadJson">下载 export.json</button>
+    </div>
+    <div class="table-wrap">
+      <table id="pubTable"><thead></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <!-- 日志 -->
+  <section class="card">
+    <h2>日志</h2>
+    <div class="row">
+      <select id="logLevel">
+        <option>ALL</option><option>INFO</option><option>WARN</option><option>ERROR</option><option>DEBUG</option>
+      </select>
+      <button id="btnLogPause">暂停滚动</button>
+      <button id="btnLogClear">清空</button>
+      <button id="btnLogCopy">复制</button>
+      <button id="btnLogDownload">下载</button>
+    </div>
+    <pre id="logs" class="logs"></pre>
+  </section>
+</main>
+
+<script>window.__BUILD_SHA__="dev";</script>
+<script src="./app.js?v=2"></script>
+
+<!-- 拦截旧监听（捕获阶段）+ 输入记忆，避免“必须 token”的老弹窗 -->
 <script>
 (function () {
-  // ---------- 工具 ----------
-  const $ = (s) => document.querySelector(s);
+  const $ = s => document.querySelector(s);
   const LS = {
-    get: (k, d='') => { try { return localStorage.getItem(k) ?? d; } catch(e){ return d; } },
-    set: (k, v)   => { try { localStorage.setItem(k, v); } catch(e){} }
+    get:(k,d='')=>{try{return localStorage.getItem(k) ?? d;}catch(e){return d}},
+    set:(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}}
   };
-  function normalizeWss(raw) {
-    if (!raw) return '';
-    try {
-      const u = raw.startsWith('ws') ? new URL(raw)
-        : new URL(`wss://${raw.replace(/^\/+/, '')}`);
+
+  const rawUrl = $('#rawUrl'), rawToken = $('#rawToken');
+  const pubUrl = $('#pubUrl'), pubToken = $('#pubToken');
+  const btnRawConnect = $('#btnRawConnect'), btnPubConnect = $('#btnPubConnect');
+
+  function normalizeWss(raw){
+    if(!raw) return '';
+    try{
+      const u = raw.startsWith('ws')? new URL(raw)
+        : new URL('wss://' + raw.replace(/^\/+/, ''));
       return u.toString();
-    } catch(e) {
-      return raw.trim();
-    }
-  }
-  function safeConnect(which, finalUrl) {
-    // 优先走你 app.js 暴露的方法；否则直接 new WebSocket
-    if (which === 'src' && typeof window.connectSource === 'function') {
-      window.connectSource(finalUrl);
-    } else if (which === 'pub' && typeof window.connectPublisher === 'function') {
-      window.connectPublisher(finalUrl);
-    } else {
-      const key = which === 'src' ? 'srcWS' : 'pubWS';
-      try { window[key]?.close?.(); } catch(e){}
-      window[key] = new WebSocket(finalUrl);
-    }
+    }catch(e){ return raw.trim(); }
   }
 
-  // ---------- DOM ----------
-  const rawUrl   = $('#rawUrl');
-  const rawToken = $('#rawToken');
-  const pubUrl   = $('#pubUrl');
-  const pubToken = $('#pubToken');
-
-  const btnRawConnect = $('#btnRawConnect');
-  const btnPubConnect = $('#btnPubConnect');
-
-  // ---------- 恢复输入 ----------
-  window.addEventListener('DOMContentLoaded', () => {
-    if (rawUrl)   rawUrl.value   = LS.get('tt_raw_wss_url', rawUrl.value || '');
-    if (rawToken) rawToken.value = LS.get('tt_raw_token',   rawToken.value || '');
-    if (pubUrl)   pubUrl.value   = LS.get('tt_pub_wss_url', pubUrl.value || '');
-    if (pubToken) pubToken.value = LS.get('tt_pub_token',   pubToken.value || '');
+  // 恢复
+  window.addEventListener('DOMContentLoaded', ()=>{
+    if(rawUrl)   rawUrl.value   = LS.get('tt_raw_wss_url', rawUrl.value||'');
+    if(rawToken) rawToken.value = LS.get('tt_raw_token',   rawToken.value||'');
+    if(pubUrl)   pubUrl.value   = LS.get('tt_pub_wss_url', pubUrl.value||'');
+    if(pubToken) pubToken.value = LS.get('tt_pub_token',   pubToken.value||'');
+    const bi = document.getElementById('buildInfo');
+    if(bi) bi.textContent = (window.__BUILD_SHA__ || 'dev');
   });
 
-  // 输入变更即保存
   ['input','change','blur'].forEach(ev=>{
     rawUrl?.addEventListener(ev,   ()=>LS.set('tt_raw_wss_url', (rawUrl.value||'').trim()));
     rawToken?.addEventListener(ev, ()=>LS.set('tt_raw_token',   (rawToken.value||'').trim()));
@@ -55,64 +197,43 @@
     pubToken?.addEventListener(ev, ()=>LS.set('tt_pub_token',   (pubToken.value||'').trim()));
   });
 
-  // ---------- 关键：捕获阶段拦截点击，阻断旧监听 ----------
-  function hookConnectButton(btn, buildFinalUrl, which) {
-    if (!btn) return;
-    // 去掉可能的内联 onclick
-    btn.onclick = null;
+  function hook(btn, which){
+    if(!btn) return;
+    btn.onclick=null;
+    btn.addEventListener('click', (e)=>{
+      e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
 
-    btn.addEventListener('click', (e) => {
-      // 在捕获阶段就拦截，避免旧脚本的冒泡监听弹窗
-      e.preventDefault();
-      e.stopPropagation();
-      e.stopImmediatePropagation();
+      const urlField = which==='src'? rawUrl: pubUrl;
+      const tokField = which==='src'? rawToken: pubToken;
+      const emptyMsg = which==='src'? '请填写 原始 WSS 地址': '请填写 发布 WSS 地址';
 
-      const {urlField, tokenField, emptyMsg} = buildFinalUrl();
-      const raw = (urlField?.value || '').trim();
-      if (!raw) {
-        // 提示文案改为“地址”，避免和旧脚本提示词完全一致
-        alert(emptyMsg);
-        urlField?.focus();
-        return;
-      }
+      const raw = (urlField?.value||'').trim();
+      if(!raw){ alert(emptyMsg); urlField?.focus(); return; }
 
       let finalUrl = normalizeWss(raw);
-      const t = (tokenField?.value || '').trim();
-      try {
-        const u = new URL(finalUrl);
-        if (t) u.searchParams.set('token', t);
-        finalUrl = u.toString();
-      } catch(e) {}
+      const t = (tokField?.value||'').trim();
+      try{ const u=new URL(finalUrl); if(t) u.searchParams.set('token',t); finalUrl=u.toString(); }catch(e){}
 
-      // 记忆
-      if (which === 'src') {
-        LS.set('tt_raw_wss_url', raw);
-        if (t) LS.set('tt_raw_token', t);
-      } else {
-        LS.set('tt_pub_wss_url', raw);
-        if (t) LS.set('tt_pub_token', t);
+      if(which==='src'){ LS.set('tt_raw_wss_url', raw); if(t) LS.set('tt_raw_token', t); }
+      else { LS.set('tt_pub_wss_url', raw); if(t) LS.set('tt_pub_token', t); }
+
+      if(which==='src' && typeof window.connectSource==='function') window.connectSource(finalUrl);
+      else if(which==='pub' && typeof window.connectPublisher==='function') window.connectPublisher(finalUrl);
+      else {
+        // 最简兜底，避免空白：直接 new WebSocket，不依赖 app.js
+        try {
+          const ws = new WebSocket(finalUrl);
+          ws.onopen = ()=>console.log(which,'open');
+          ws.onclose= ()=>console.log(which,'close');
+          ws.onerror= (err)=>console.warn(which,'error',err);
+        } catch(e) { console.error('WS open failed', e); }
       }
-
-      safeConnect(which, finalUrl);
-    }, /* useCapture */ true);
+    }, true); // 捕获阶段，屏蔽旧监听
   }
 
-  // 原始流按钮
-  hookConnectButton(btnRawConnect, () => ({
-    urlField: rawUrl,
-    tokenField: rawToken,
-    emptyMsg: '请填写 原始 WSS 地址'
-  }), 'src');
-
-  // 发布按钮（不再强制 token）
-  hookConnectButton(btnPubConnect, () => ({
-    urlField: pubUrl,
-    tokenField: pubToken,
-    emptyMsg: '请填写 发布 WSS 地址'
-  }), 'pub');
-
-  // 可选：把构建信息写右上角
-  const bi = document.getElementById('buildInfo');
-  if (bi) bi.textContent = (window.__BUILD_SHA__ || 'dev');
+  hook(btnRawConnect, 'src');
+  hook(btnPubConnect, 'pub');
 })();
 </script>
+</body>
+</html>
