@@ -1,5 +1,6 @@
 // Cloudflare Pages Functions single WS endpoint: /ws
-// 角色：publisher（F端） 可发布；viewer（A端） 只读
+// 角色：publisher（F端发布） / viewer（A端只读）
+
 const clients = {
   publishers: new Set(),
   viewers: new Set(),
@@ -7,86 +8,151 @@ const clients = {
 
 export async function onRequest(context) {
   const { request, env } = context;
+
   if (request.headers.get('Upgrade') !== 'websocket') {
     return new Response('Expected WebSocket', { status: 400 });
   }
 
-  const url = new URL(request.url);
+  // Origin 白名单（可选）
+  const allow = (env.ALLOW_ORIGINS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  if (allow.length) {
+    const origin = request.headers.get('Origin') || '';
+    if (origin && !allow.includes(origin)) {
+      return new Response('origin not allowed', { status: 403 });
+    }
+  }
+
   const pair = new WebSocketPair();
   const [client, server] = Object.values(pair);
 
   server.accept();
-  let role = 'viewer';
+
+  const url = new URL(request.url);
   const meta = { ip: request.headers.get('CF-Connecting-IP') || 'unknown' };
 
-  function closeAll(reason) {
-    try { server.close(1000, reason || 'done'); } catch {}
-  }
+  // URL 里的快速声明（可选）
+  let role = (url.searchParams.get('role') || '').toLowerCase() || 'viewer';
+  let token = url.searchParams.get('token') || '';
 
-  function broadcastToViewers(obj) {
-    const msg = typeof obj==='string' ? obj : JSON.stringify(obj);
+  // 工具函数
+  const sendJSON = (ws, obj) => {
+    try { ws.send(typeof obj === 'string' ? obj : JSON.stringify(obj)); } catch {}
+  };
+  const closeWith = (ws, code = 1008, reason = 'bye') => {
+    try { ws.close(code, reason); } catch {}
+  };
+  const broadcastToViewers = (obj) => {
+    const msg = typeof obj === 'string' ? obj : JSON.stringify(obj);
     for (const ws of clients.viewers) {
       try { ws.send(msg); } catch {}
     }
+  };
+  const enterAsPublisher = () => {
+    role = 'publisher';
+    clients.publishers.add(server);
+    sendJSON(server, { type: 'ok', role, ip: meta.ip });
+  };
+  const enterAsViewer = () => {
+    role = 'viewer';
+    clients.viewers.add(server);
+    sendJSON(server, { type: 'ok', role, ip: meta.ip });
+  };
+
+  // —— 首次根据 URL 参数尝试放行（可选，未设置 token 环境变量时不校验）——
+  const tryEnterByQuery = () => {
+    if (role === 'publisher') {
+      // 仅当配置了 PUBLISH_TOKEN 才验证；否则不校验直接放行
+      if (env.PUBLISH_TOKEN && token !== env.PUBLISH_TOKEN) {
+        sendJSON(server, { type: 'error', msg: 'auth failed' });
+        closeWith(server, 1008, 'auth failed');
+        return false;
+      }
+      enterAsPublisher();
+      return true;
+    }
+    // viewer
+    if (env.READ_TOKEN && token !== env.READ_TOKEN) {
+      sendJSON(server, { type: 'error', msg: 'auth failed' });
+      closeWith(server, 1008, 'auth failed');
+      return false;
+    }
+    enterAsViewer();
+    return true;
+  };
+
+  // 尝试按 URL 直接进入（默认 viewer）
+  if (!tryEnterByQuery()) {
+    return new Response(null, { status: 101, webSocket: client });
   }
 
+  // —— WS 事件 —— //
   server.addEventListener('message', (ev) => {
     let data = ev.data;
     try { data = JSON.parse(ev.data); } catch {}
 
-    // 首帧鉴权（可多次发；以最后一次为准）
+    // 首帧/重复鉴权（以最后一次为准）
     if (data && data.type === 'auth') {
-      if (data.role === 'publisher') {
-        const ok = !!env.PUBLISH_TOKEN && data.token === env.PUBLISH_TOKEN;
-        if (!ok) {
-          try { server.send(JSON.stringify({type:'error', msg:'auth failed'})); } catch {}
-          closeAll('auth failed');
+      const wantRole = (data.role || '').toLowerCase() || 'viewer';
+      const tok = data.token || '';
+
+      if (wantRole === 'publisher') {
+        if (env.PUBLISH_TOKEN && tok !== env.PUBLISH_TOKEN) {
+          sendJSON(server, { type: 'error', msg: 'auth failed' });
+          closeWith(server, 1008, 'auth failed');
           return;
         }
-        role = 'publisher';
-        clients.publishers.add(server);
-        try { server.send(JSON.stringify({type:'ok', role})); } catch {}
+        // 切换角色时要从集合里迁移
+        clients.viewers.delete(server);
+        enterAsPublisher();
         return;
       } else {
-        // viewer 可选 token；若 env.READ_TOKEN 存在则校验
-        if (env.READ_TOKEN && data.token !== env.READ_TOKEN) {
-          try { server.send(JSON.stringify({type:'error', msg:'auth failed'})); } catch {}
-          closeAll('auth failed');
+        if (env.READ_TOKEN && tok !== env.READ_TOKEN) {
+          sendJSON(server, { type: 'error', msg: 'auth failed' });
+          closeWith(server, 1008, 'auth failed');
           return;
         }
-        role = 'viewer';
-        clients.viewers.add(server);
-        try { server.send(JSON.stringify({type:'ok', role})); } catch {}
+        clients.publishers.delete(server);
+        enterAsViewer();
         return;
       }
     }
 
-    // 发布消息（仅 publisher 可发）
+    // 心跳
+    if (data === 'ping' || (data && data.type === 'ping')) {
+      sendJSON(server, { type: 'pong', ts: Date.now() });
+      return;
+    }
+
+    // 仅 publisher 可发布
     if (role === 'publisher') {
-      if (data && (data.type === 'snapshot' || data.type === 'opportunity' || data.type === 'heartbeat')) {
+      // 支持 snapshot / opportunity / heartbeat 或数组转发
+      if (Array.isArray(data)) {
+        for (const item of data) broadcastToViewers(item);
+        return;
+      }
+      if (
+        data &&
+        (data.type === 'snapshot' ||
+         data.type === 'opportunity' ||
+         data.type === 'heartbeat' ||
+         data.type === 'message')
+      ) {
         broadcastToViewers(data);
       }
       return;
     }
 
-    // viewer 发来的消息忽略
+    // viewer 消息忽略
   });
 
   server.addEventListener('close', () => {
     clients.publishers.delete(server);
     clients.viewers.delete(server);
   });
-
-  // 允许的 Origin（可选）
-  const allow = (env.ALLOW_ORIGINS || '').split(',').map(s=>s.trim()).filter(Boolean);
-  if (allow.length) {
-    const origin = request.headers.get('Origin') || '';
-    if (!allow.includes(origin)) {
-      try { server.send(JSON.stringify({type:'error', msg:'origin not allowed'})); } catch {}
-      closeAll('origin not allowed');
-      return new Response(null, { status: 403 });
-    }
-  }
 
   return new Response(null, { status: 101, webSocket: client });
 }
