@@ -1,0 +1,30 @@
+[
+  {
+    "event_id": "E1001",
+    "source": "isp",
+    "league": "英超",
+    "home": "阿森纳",
+    "away": "切尔西",
+    "period": "FT",
+    "market": "ou",
+    "line_text": "2.5",
+    "pickA": { "book": "Singbet", "selection": "over", "odds": 0.95 },
+    "pickB": { "book": "Parimatch", "selection": "under", "odds": 0.98 },
+    "score": "0-0",
+    "kickoffAt": 1730265600000
+  },
+  {
+    "event_id": "E1002",
+    "source": "pm",
+    "league": "西甲",
+    "home": "巴萨",
+    "away": "皇马",
+    "period": "HT",
+    "market": "ah",
+    "line_text": "-0.25",
+    "pickA": { "book": "Parimatch", "selection": "home", "odds": 1.02 },
+    "pickB": { "book": "Singbet", "selection": "away", "odds": 0.92 },
+    "score": "1-0",
+    "kickoffAt": 1730269200000
+  }
+]
