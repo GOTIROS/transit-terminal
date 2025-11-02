@@ -1,313 +1,416 @@
-/* F端主脚本：全WSS + Mock + 上下表 + 发布到 /ws 广播 */
+/* public/app.js — F端 · 中转与发布
+ * 关键点：
+ * 1) 发布端连接不再强制要求 token，允许空；同时用 role=publisher 明确身份
+ * 2) 若填写 token 仍会附带；未填写则不带
+ * 3) 原始流连接（Server→F）、Mock、映射加载、上表/下表、导出、发布 Snapshot/Heartbeat、日志
+ * 4) 选择器做了多路回退（id/name），避免因 DOM 命名差异绑不上
+ */
+"use strict";
 
-const $ = (s, d=document)=>d.querySelector(s);
-const $$ = (s, d=document)=>Array.from(d.querySelectorAll(s));
+/* ========================== Utils ========================== */
+const $  = (sel) => document.querySelector(sel);
+const $$ = (sel) => Array.from(document.querySelectorAll(sel));
 
-/* =============== 日志 =============== */
-let LOG_PAUSE = false;
-function log(level, msg, obj) {
-  const lv = $('#logLevel').value;
-  if (lv!=='ALL' && lv!==level) return;
-  const line = `[${new Date().toLocaleTimeString()}][${level}] ${msg}` + (obj?` ${JSON.stringify(obj).slice(0,800)}`:'');
-  const pre = $('#logs');
-  pre.textContent += line + '\n';
-  if (!LOG_PAUSE) pre.scrollTop = pre.scrollHeight;
-}
-$('#btnLogPause').onclick = ()=> LOG_PAUSE = !LOG_PAUSE;
-$('#btnLogClear').onclick = ()=> $('#logs').textContent='';
-$('#btnLogCopy').onclick = async()=> {
-  await navigator.clipboard.writeText($('#logs').textContent||'');
-  log('INFO','已复制日志到剪贴板');
-};
-$('#btnLogDownload').onclick = ()=> {
-  const blob = new Blob([$('#logs').textContent||''], {type:'text/plain'});
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = `f-logs-${Date.now()}.txt`;
-  a.click();
-};
-
-/* =============== 状态灯 =============== */
-function paintDot(kind, state) {
-  const dot = kind==='raw' ? $('#rawDot') : $('#pubDot');
-  const txt = kind==='raw' ? $('#rawText') : $('#pubText');
-  const cls = {idle:'gray', connecting:'blue', open:'green', error:'red'}[state] || 'gray';
-  dot.className = 'dot '+cls;
-  txt.textContent = {idle:'未连接',connecting:'连接中',open:'已连接',error:'错误'}[state] || '未连接';
-}
-
-/* =============== WebSocket 客户端（指数回退重连） =============== */
-class WSClient {
-  constructor(name){ this.name=name; this.ws=null; this.url=''; this.token=''; this.timer=null; this.backoff=1000; this.onmsg=null; }
-  connect(url, token, onmsg){
-    this.url=url; this.token=token||''; this.onmsg=onmsg;
-    this._open();
+function pick(...sels) {
+  for (const s of sels) {
+    if (!s) continue;
+    const el = document.querySelector(s);
+    if (el) return el;
   }
-  _open(){
-    if(!this.url){ return; }
-    const u = new URL(this.url);
-    if (this.token && !u.searchParams.get('token') && !u.searchParams.get('auth_key')) {
-      u.searchParams.set('token', this.token);
-    }
-    const displayUrl = u.toString();
-    (this.name==='raw'?paintDot('raw','connecting'):paintDot('pub','connecting'));
-    try {
-      this.ws = new WebSocket(displayUrl);
-    } catch(e) {
-      log('ERROR', `${this.name} 构造WS失败`, {e:String(e)});
-      return this._retry();
-    }
-    this.ws.onopen = ()=>{
-      this.backoff = 1000;
-      (this.name==='raw'?paintDot('raw','open'):paintDot('pub','open'));
-      log('INFO', `${this.name} 打开`, {url:displayUrl});
-      // 发布端在 onopen 后立刻做 auth（publisher）
-      if (this.name==='pub' && this.token) {
-        this.send({type:'auth', role:'publisher', token:this.token});
+  return null;
+}
+
+function jsonParseSafe(txt, fb=null) {
+  try { return JSON.parse(typeof txt === 'string' ? txt : String(txt)); } catch { return fb; }
+}
+
+function jsonStringSafe(obj) {
+  try { return JSON.stringify(obj); } catch { return String(obj); }
+}
+
+function nowTS() { return new Date().toISOString().slice(11,19); }
+
+/* ========================== Logger ========================== */
+const elLogList = pick('#logList', '#logBody', 'pre[data-log]', '#logPre');
+const elLogLevel = pick('#logLevel', 'select[name="logLevel"]');
+
+function addLog(level, msg, extra) {
+  if (!elLogList) return;
+  const line = `[${nowTS()}][${level}] ${msg}` + (extra ? ' ' + jsonStringSafe(extra) : '');
+  if (elLogList.tagName === 'PRE') {
+    elLogList.textContent += (elLogList.textContent ? '\n' : '') + line;
+  } else {
+    const li = document.createElement('div');
+    li.textContent = line;
+    elLogList.appendChild(li);
+    // 滚动到底
+    elLogList.scrollTop = elLogList.scrollHeight;
+  }
+  // 控制台也打一份（便于排查）
+  if (level === 'ERROR') console.error(line);
+  else if (level === 'WARN') console.warn(line);
+  else console.log(line);
+}
+
+/* ========================== State ========================== */
+const store = {
+  // 上表：原始数据
+  rawRows: [],
+  // 下表：发布表候选
+  pubRows: [],
+  // 映射（可选）
+  maps: {
+    id: { leagues: null, teams: null, bookmakers: null },
+    en: { leagues: null, teams: null },
+  },
+  // 连接对象
+  wsSrc: null,      // Server -> F
+  wsPub: null,      // F -> 发布端（feed.youdatan.com）
+};
+
+/* ========================== DOM Refs（多路回退） ========================== */
+// 原始流连接（Server -> F）
+const elSrcUrl    = pick('#srcUrl',    'input[name="srcUrl"]');
+const elSrcToken  = pick('#srcToken',  'input[name="srcToken"]');
+const btnSrcConn  = pick('#btnSrcConn','button[data-action="src-connect"]', 'button#srcConnect');
+const btnSrcOff   = pick('#btnSrcOff', 'button[data-action="src-off"]');
+const btnMockToggle = pick('#btnMock', 'button[data-action="mock-toggle"]');
+
+// 发布连接（F -> feed.youdatan.com）
+const elPubUrl    = pick('#pubUrl',    'input[name="pubUrl"]');
+const elPubToken  = pick('#pubToken',  'input[name="pubToken"]'); // 可空
+const btnPubConn  = pick('#btnPubConn','button[data-action="pub-connect"]', 'button#pubConnect');
+const btnPubOff   = pick('#btnPubOff', 'button[data-action="pub-off"]');
+const btnSnapshot = pick('#btnSnapshot','button[data-action="publish-snapshot"]');
+const btnHeartbeat= pick('#btnHeartbeat','button[data-action="publish-heartbeat"]');
+
+// 映射 CSV
+const elMapBook   = pick('#map_bookmakers', 'input[name="map_bookmakers"]');
+const elMapLeaId  = pick('#map_leagues_id', 'input[name="map_leagues_id"]');
+const elMapTeamId = pick('#map_teams_id',   'input[name="map_teams_id"]');
+const elMapLeaEn  = pick('#map_leagues_en', 'input[name="map_leagues_en"]');
+const elMapTeamEn = pick('#map_teams_en',   'input[name="map_teams_en"]');
+const btnMapsLoad = pick('#btnMapsLoad',    'button[data-action="maps-load"]');
+
+// 上表/下表 & 过滤/导出
+const btnAddAll   = pick('#btnAddAll',      'button[data-action="raw-add-all"]');
+const btnClearRaw = pick('#btnClearRaw',    'button[data-action="raw-clear"]');
+const btnApply    = pick('#btnApplyFilters','button[data-action="apply-filters"]');
+const btnClear    = pick('#btnClearFilters','button[data-action="clear-filters"]');
+const btnExport   = pick('#btnExport',      'button[data-action="export-json"]');
+
+// 表格 tbody
+const elRawBody   = pick('#rawTbody', 'tbody#rawBody', 'tbody[data-role="raw"]');
+const elPubBody   = pick('#pubTbody', 'tbody#pubBody', 'tbody[data-role="pub"]');
+
+// 过滤控件（尽量回退）
+const selPubSource= pick('#pubSource','select[name="pubSource"]');
+const selPubMarket= pick('#pubMarket','select[name="pubMarket"]');
+const selPubPeriod= pick('#pubPeriod','select[name="pubPeriod"]');
+
+/* ========================== Renderers ========================== */
+function renderRawTable() {
+  if (!elRawBody) return;
+  elRawBody.innerHTML = '';
+  for (const r of store.rawRows) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${r.event_id || ''}</td>
+      <td>${r.source || ''}</td>
+      <td>${r.league || ''}</td>
+      <td>${r.home || ''}</td>
+      <td>${r.away || ''}</td>
+      <td>${r.period || ''}</td>
+      <td>${r.market || ''}</td>
+      <td>${r.line_text || ''}</td>
+      <td>${jsonStringSafe(r.pickA || '')}</td>
+      <td>${jsonStringSafe(r.pickB || '')}</td>
+    `.trim();
+    elRawBody.appendChild(tr);
+  }
+}
+
+function renderPubTable() {
+  if (!elPubBody) return;
+  // 简单过滤
+  let rows = store.pubRows;
+  const src = selPubSource?.value || '全部';
+  const mk  = selPubMarket?.value || '全部';
+  const prd = selPubPeriod?.value || '全部';
+  rows = rows.filter(r => {
+    if (src !== '全部' && r.source !== src) return false;
+    if (mk  !== '全部' && r.market !== mk) return false;
+    if (prd !== '全部' && r.period !== prd) return false;
+    return true;
+  });
+
+  elPubBody.innerHTML = '';
+  for (const r of rows) {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>${r.event_id || ''}</td>
+      <td>${r.source || ''}</td>
+      <td>${r.league || ''}</td>
+      <td>${r.home || ''}</td>
+      <td>${r.away || ''}</td>
+      <td>${r.period || ''}</td>
+      <td>${r.market || ''}</td>
+      <td>${r.line_text || ''}</td>
+      <td>${jsonStringSafe(r.pickA || '')}</td>
+      <td>${jsonStringSafe(r.pickB || '')}</td>
+    `.trim();
+    elPubBody.appendChild(tr);
+  }
+}
+
+/* ========================== Mock / 映射 ========================== */
+async function loadMock() {
+  try {
+    const res = await fetch('./mock.json', { cache: 'no-store' });
+    const json = await res.json();
+    // 期待结构：[{event_id, source, league, home, away, period, market, line_text, pickA, pickB}, ...]
+    store.rawRows = Array.isArray(json) ? json : (json.data || []);
+    addLog('INFO', '载入 Mock 数据', { count: store.rawRows.length });
+    renderRawTable();
+  } catch (e) {
+    addLog('ERROR', '载入 Mock 失败', e?.message || String(e));
+  }
+}
+
+async function fetchCSV(url) {
+  const res = await fetch(url, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const txt = await res.text();
+  // 简陋 CSV -> map，按第一列 id/英文、第二列 中文
+  const lines = txt.split(/\r?\n/).filter(Boolean);
+  const map = {};
+  for (const ln of lines) {
+    const [k, v] = ln.split(',').map(s=>s?.trim());
+    if (k) map[k] = v ?? '';
+  }
+  return map;
+}
+
+async function loadMappings() {
+  const jobs = [];
+  // id 映射
+  if (elMapBook?.value) jobs.push(fetchCSV(elMapBook.value).then(m=>store.maps.id.bookmakers=m));
+  if (elMapLeaId?.value) jobs.push(fetchCSV(elMapLeaId.value).then(m=>store.maps.id.leagues=m));
+  if (elMapTeamId?.value) jobs.push(fetchCSV(elMapTeamId.value).then(m=>store.maps.id.teams=m));
+  // 英文 -> 中文
+  if (elMapLeaEn?.value) jobs.push(fetchCSV(elMapLeaEn.value).then(m=>store.maps.en.leagues=m));
+  if (elMapTeamEn?.value) jobs.push(fetchCSV(elMapTeamEn.value).then(m=>store.maps.en.teams=m));
+
+  if (!jobs.length) {
+    addLog('WARN', '未填写任何 CSV 路径，跳过加载');
+    return;
+  }
+  try {
+    await Promise.all(jobs);
+    addLog('INFO', '映射包已加载/刷新');
+  } catch (e) {
+    addLog('ERROR', '映射包加载失败', e?.message || String(e));
+  }
+}
+
+/* ========================== Server -> F：原始流连接 ========================== */
+function connectSource() {
+  const url   = (elSrcUrl?.value || '').trim();
+  const token = (elSrcToken?.value || '').trim();
+
+  if (!url) { alert('请填写 原始 WSS URL'); return; }
+
+  try {
+    if (store.wsSrc) { try { store.wsSrc.close(); } catch {} store.wsSrc = null; }
+
+    // 可选：token 通过 ?token=xxx 拼到 URL；也可在首帧发
+    const u = new URL(url);
+    if (token) u.searchParams.set('token', token);
+
+    const ws = new WebSocket(u.toString());
+    store.wsSrc = ws;
+
+    ws.onopen = () => {
+      addLog('INFO', 'src 打开', { url: u.toString() });
+      // 若服务端用首帧 auth，这里再发一次也无妨
+      if (token) ws.send(jsonStringSafe({ type:'auth', token }));
+    };
+
+    ws.onmessage = (ev) => {
+      const payload = jsonParseSafe(ev.data, ev.data);
+      // 兼容几种形态：数组即快照 / {type:'snapshot', data:[...]} / {type:'opportunity', data:{...}}
+      if (Array.isArray(payload)) {
+        store.rawRows = payload;
+        addLog('DEBUG', 'src 快照(数组)', { count: payload.length });
+        renderRawTable();
+      } else if (payload && typeof payload === 'object') {
+        if (payload.type === 'snapshot' && Array.isArray(payload.data)) {
+          store.rawRows = payload.data;
+          addLog('DEBUG', 'src 快照', { count: payload.data.length });
+          renderRawTable();
+        } else if (payload.type === 'opportunity' && payload.data) {
+          // 增量追加（你也可以按 event_id 去重/合并）
+          store.rawRows.unshift(payload.data);
+          renderRawTable();
+        } else if (payload.type === 'heartbeat') {
+          // 心跳仅记日志
+        } else {
+          // 其它：当做通用日志
+          addLog('DEBUG', 'src 消息', payload);
+        }
       }
     };
-    this.ws.onmessage = (ev)=>{
-      let data = ev.data;
-      try { data = JSON.parse(ev.data); } catch {}
-      this.onmsg && this.onmsg(data);
-    };
-    this.ws.onerror = (e)=>{
-      (this.name==='raw'?paintDot('raw','error'):paintDot('pub','error'));
-      log('ERROR', `${this.name} 错误`, {e:String(e)});
-    };
-    this.ws.onclose = ()=>{
-      (this.name==='raw'?paintDot('raw','error'):paintDot('pub','error'));
-      log('WARN', `${this.name} 断开，准备重连`, {backoff:this.backoff});
-      this._retry();
-    };
-  }
-  _retry(){
-    clearTimeout(this.timer);
-    const t = this.backoff + Math.floor(Math.random()*this.backoff*0.2);
-    this.timer = setTimeout(()=>this._open(), Math.min(t, 30000));
-    this.backoff = Math.min(this.backoff*2, 30000);
-  }
-  close(){
-    clearTimeout(this.timer);
-    try{ this.ws && this.ws.close(); }catch{}
-    this.ws=null; (this.name==='raw'?paintDot('raw','idle'):paintDot('pub','idle'));
-  }
-  send(obj){
-    if (this.ws && this.ws.readyState===1) this.ws.send(JSON.stringify(obj));
-  }
-}
-const rawWS = new WSClient('raw');
-const pubWS = new WSClient('pub');
 
-/* =============== 数据存储与表格渲染 =============== */
-let MOCK_ON = false;
-let rawRows = [];        // 原始条目（源头直接展示）
-let publishRows = [];    // 发布表（筛选/汉化后）
-let currentTab = 'all';  // raw 表当前 Tab
-
-function autoHeaders(rows){
-  if (!rows.length) return [];
-  const keys = new Set();
-  rows.slice(0,100).forEach(r=>Object.keys(r||{}).forEach(k=>keys.add(k)));
-  return Array.from(keys);
-}
-function renderTable(elTable, rows){
-  const thead = elTable.querySelector('thead');
-  const tbody = elTable.querySelector('tbody');
-  tbody.innerHTML = '';
-  const keys = autoHeaders(rows);
-  thead.innerHTML = '<tr>'+keys.map(k=>`<th>${k}</th>`).join('')+'</tr>';
-  rows.forEach(r=>{
-    const tr = document.createElement('tr');
-    tr.innerHTML = keys.map(k=>`<td>${escapeHtml(val(r[k]))}</td>`).join('');
-    tbody.appendChild(tr);
-  });
-}
-function escapeHtml(s){ return String(s===undefined?'':s).replace(/[&<>"']/g, m=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m])); }
-function val(v){
-  if (v===null || v===undefined) return '';
-  if (typeof v==='object') return JSON.stringify(v);
-  return v;
+    ws.onclose = (ev) => {
+      addLog('WARN', 'src 断开', { code: ev.code, reason: ev.reason });
+      store.wsSrc = null;
+    };
+    ws.onerror = (err) => {
+      addLog('ERROR', 'src 错误', err?.message || String(err));
+    };
+  } catch (e) {
+    addLog('ERROR', 'src 连接异常', e?.message || String(e));
+  }
 }
 
-/* 过滤器（简单版） */
-function applyFilter(){
-  const src = $('#f_source').value.trim();
-  const mkt = $('#f_market').value.trim();
-  const per = $('#f_period').value.trim();
-  let arr = publishRows.slice();
-  if (src) arr = arr.filter(x=> (x.source||'')===src);
-  if (mkt) arr = arr.filter(x=> (x.market||'')===mkt);
-  if (per) arr = arr.filter(x=> (x.period||'')===per);
-  renderTable($('#pubTable'), arr);
+function disconnectSource() {
+  if (store.wsSrc) {
+    try { store.wsSrc.close(1000, 'by user'); } catch {}
+    store.wsSrc = null;
+    addLog('INFO', 'src 已断开');
+  }
 }
-$('#btnApplyFilter').onclick = applyFilter;
-$('#btnClearFilter').onclick = ()=>{ $('#f_source').value=''; $('#f_market').value=''; $('#f_period').value=''; applyFilter(); };
-$('#btnClearPublish').onclick = ()=>{ publishRows=[]; applyFilter(); };
-$('#btnDownloadJson').onclick = ()=>{
-  const blob = new Blob([JSON.stringify(publishRows,null,2)], {type:'application/json'});
+
+/* ========================== F -> 发布端：不强制 token ========================== */
+function buildPublisherUrl(raw, token) {
+  const u = new URL(raw);
+  u.searchParams.set('role', 'publisher'); // 关键：明确身份
+  if (token) u.searchParams.set('token', token);
+  return u.toString();
+}
+
+function connectPublisher() {
+  const pubUrl   = (elPubUrl?.value || '').trim();
+  const pubToken = (elPubToken?.value || '').trim(); // 可空
+
+  if (!pubUrl) { alert('请填写 发布 WSS URL'); return; }
+
+  try {
+    if (store.wsPub) { try { store.wsPub.close(); } catch {} store.wsPub = null; }
+
+    const finalUrl = buildPublisherUrl(pubUrl, pubToken);
+    const ws = new WebSocket(finalUrl);
+    store.wsPub = ws;
+
+    ws.onopen = () => {
+      // 首帧再发一次 auth（无 token 也允许）
+      ws.send(jsonStringSafe({ type:'auth', role:'publisher', token: pubToken || '' }));
+      addLog('INFO', 'pub 打开', { url: finalUrl });
+    };
+
+    ws.onmessage = (ev) => {
+      addLog('DEBUG', '发布端消息', jsonParseSafe(ev.data, ev.data));
+    };
+
+    ws.onclose = (ev) => {
+      addLog('WARN', 'pub 断开', { code: ev.code, reason: ev.reason });
+      store.wsPub = null;
+    };
+
+    ws.onerror = (err) => {
+      addLog('ERROR', 'pub 错误', err?.message || String(err));
+    };
+  } catch (e) {
+    addLog('ERROR', 'pub 连接异常', e?.message || String(e));
+  }
+}
+
+function disconnectPublisher() {
+  if (store.wsPub) {
+    try { store.wsPub.close(1000, 'by user'); } catch {}
+    store.wsPub = null;
+    addLog('INFO', 'pub 已断开');
+  }
+}
+
+/* ========================== 发布：Snapshot / Heartbeat ========================== */
+function publishSnapshot() {
+  if (!store.wsPub || store.wsPub.readyState !== 1) {
+    alert('发布端未连接'); return;
+  }
+  if (!store.pubRows.length) {
+    alert('下表为空，无数据可发'); return;
+  }
+  const payload = { type:'snapshot', data: store.pubRows };
+  store.wsPub.send(jsonStringSafe(payload));
+  addLog('INFO', '已发送 Snapshot', { count: store.pubRows.length });
+}
+
+function publishHeartbeat() {
+  if (!store.wsPub || store.wsPub.readyState !== 1) return;
+  const payload = { type:'heartbeat', ts: Date.now() };
+  store.wsPub.send(jsonStringSafe(payload));
+  addLog('DEBUG', '已发送 Heartbeat');
+}
+
+/* ========================== 上表→下表 / 过滤 / 导出 ========================== */
+function addAllToPublish() {
+  store.pubRows = store.rawRows.slice();
+  renderPubTable();
+  addLog('INFO', '已将上表全部加入下表', { count: store.pubRows.length });
+}
+
+function clearRaw() {
+  store.rawRows = [];
+  renderRawTable();
+  addLog('INFO', '上表已清空');
+}
+
+function applyFilters() {
+  renderPubTable();
+}
+
+function clearFilters() {
+  if (selPubSource) selPubSource.value = '全部';
+  if (selPubMarket) selPubMarket.value = '全部';
+  if (selPubPeriod) selPubPeriod.value = '全部';
+  renderPubTable();
+}
+
+function exportJSON() {
+  const blob = new Blob([jsonStringSafe(store.pubRows)], { type: 'application/json;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
+  a.href = url;
   a.download = 'export.json';
   a.click();
-};
-
-/* Tabs */
-$$('.tab').forEach(btn=>{
-  btn.onclick = ()=>{
-    $$('.tab').forEach(b=>b.classList.remove('active'));
-    btn.classList.add('active');
-    currentTab = btn.dataset.tab;
-    refreshRawTable();
-  };
-});
-function refreshRawTable(){
-  const total = rawRows.length;
-  $('#rawCount').textContent = String(total);
-  let arr = rawRows;
-  if (currentTab==='isp') arr = rawRows.filter(x=>x.source==='isp');
-  if (currentTab==='pm') arr = rawRows.filter(x=>x.source==='pm');
-  renderTable($('#rawTable'), arr);
+  URL.revokeObjectURL(url);
+  addLog('INFO', 'export.json 已下载', { count: store.pubRows.length });
 }
 
-/* =============== 映射（CSV） =============== */
-let maps = { book:{}, league:{}, team:{}, enLeague:{}, enTeam:{} };
-async function loadCsv(url){
-  const res = await fetch(url, {cache:'no-store'});
-  if (!res.ok) throw new Error(`load csv failed: ${res.status}`);
-  const text = await res.text();
-  const lines = text.split(/\r?\n/).filter(Boolean);
-  const rows = lines.map(l=>l.split(',').map(s=>s.trim()));
-  return rows;
-}
-async function loadMappings(){
-  const mbook = $('#m_book').value || '/mappings/id/bookmakers.csv';
-  const mleag = $('#m_league').value || '/mappings/id/leagues.csv';
-  const mteam = $('#m_team').value || '/mappings/id/teams.csv';
-  const mleEn = $('#m_league_en').value || '/mappings/en/leagues_en2cn.csv';
-  const mteEn = $('#m_team_en').value || '/mappings/en/teams_en2cn.csv';
-  try{
-    const [book,leag,team, enL,enT] = await Promise.all([
-      loadCsv(mbook), loadCsv(mleag), loadCsv(mteam), loadCsv(mleEn), loadCsv(mteEn)
-    ]);
-    maps.book = objByFirstCol(book);
-    maps.league = objByFirstCol(leag);
-    maps.team = objByFirstCol(team);
-    maps.enLeague = objByFirstCol(enL);
-    maps.enTeam = objByFirstCol(enT);
-    $('#mapStatus').textContent = '已加载';
-    log('INFO','映射加载完成');
-  }catch(e){
-    $('#mapStatus').textContent = '加载失败';
-    log('ERROR','映射加载失败', {e:String(e)});
-  }
-}
-function objByFirstCol(rows){
-  const o={}; rows.forEach(r=>{ if(r.length>=2) o[r[0]]=r[1]; });
-  return o;
-}
-$('#btnLoadMaps').onclick = loadMappings;
+/* ========================== Event Bindings ========================== */
+// Server -> F
+btnSrcConn && btnSrcConn.addEventListener('click', connectSource);
+btnSrcOff  && btnSrcOff.addEventListener('click', disconnectSource);
+btnMockToggle && btnMockToggle.addEventListener('click', loadMock);
 
-/* =============== 原始流接入 =============== */
-$('#btnRawConnect').onclick = ()=>{
-  const url = ($('#rawUrl').value||'').trim();
-  const token = ($('#rawToken').value||'').trim();
-  if (!url) return alert('请填写原始 WSS URL');
-  rawWS.connect(url, token, onRawMessage);
-};
-$('#btnRawClose').onclick = ()=> rawWS.close();
-$('#btnClearRaw').onclick = ()=>{ rawRows=[]; refreshRawTable(); };
+// F -> 发布端
+btnPubConn && btnPubConn.addEventListener('click', connectPublisher);
+btnPubOff  && btnPubOff.addEventListener('click', disconnectPublisher);
+btnSnapshot && btnSnapshot.addEventListener('click', publishSnapshot);
+btnHeartbeat&& btnHeartbeat.addEventListener('click', publishHeartbeat);
 
-function onRawMessage(payload){
-  // 兼容多种：数组 / {type:'raw'|'snapshot'|'heartbeat'|...}
-  if (Array.isArray(payload)) {
-    payload.forEach(x=>ingestRaw(x));
-    refreshRawTable();
-    return;
-  }
-  if (payload && payload.type==='raw' && Array.isArray(payload.data)) {
-    payload.data.forEach(x=>ingestRaw(x, payload.source));
-    refreshRawTable();
-    return;
-  }
-  if (payload && payload.type==='snapshot' && Array.isArray(payload.data)) {
-    payload.data.forEach(x=>ingestRaw(x));
-    refreshRawTable();
-    return;
-  }
-  if (payload && payload.type==='heartbeat') {
-    log('DEBUG','原始心跳', payload);
-    return;
-  }
-  // 不识别的也直接尝试塞一条
-  if (payload) {
-    ingestRaw(payload);
-    refreshRawTable();
-  }
-}
-function ingestRaw(x, src){
-  const item = {...x};
-  if (!item.source && src) item.source = src;
-  rawRows.push(item);
-}
+// 映射
+btnMapsLoad && btnMapsLoad.addEventListener('click', loadMappings);
 
-/* 将当前 Tab 全部加入下表候选（简单复制；映射可在后续增量中应用） */
-$('#btnAllToPublish').onclick = ()=>{
-  let arr = rawRows;
-  if (currentTab==='isp') arr = rawRows.filter(x=>x.source==='isp');
-  if (currentTab==='pm') arr = rawRows.filter(x=>x.source==='pm');
-  // 这里可在未来加入映射：ID→中文 / 英文→中文
-  publishRows.push(...arr);
-  applyFilter();
-};
+// 上表/下表/过滤/导出
+btnAddAll   && btnAddAll.addEventListener('click', addAllToPublish);
+btnClearRaw && btnClearRaw.addEventListener('click', clearRaw);
+btnApply    && btnApply.addEventListener('click', applyFilters);
+btnClear    && btnClear.addEventListener('click', clearFilters);
+btnExport   && btnExport.addEventListener('click', exportJSON);
 
-/* =============== 发布端（F → /ws → A） =============== */
-$('#btnPubConnect').onclick = ()=>{
-  const url = ($('#pubUrl').value||'').trim();
-  const tok = ($('#pubToken').value||'').trim();
-  if (!url || !tok) return alert('请填写 发布 WSS URL 与 PUBLISH_TOKEN');
-  pubWS.connect(url, tok, onPubMessage);
-};
-$('#btnPubClose').onclick = ()=> pubWS.close();
-$('#btnPublishSnap').onclick = ()=>{
-  pubWS.send({ type:'snapshot', version:'v1', data: publishRows });
-  log('INFO','已发送 snapshot', {count: publishRows.length});
-};
-$('#btnPublishBeat').onclick = ()=> pubWS.send({ type:'heartbeat', ts: Date.now() });
-function onPubMessage(msg){
-  // 当前发布端主要接收服务端确认/心跳/错误
-  log('DEBUG','发布端消息', msg);
-}
-
-/* =============== Mock 开关（离线演示） =============== */
-$('#btnToggleMock').onclick = async ()=>{
-  MOCK_ON = !MOCK_ON;
-  $('#mockBadge').textContent = `Mock: ${MOCK_ON?'ON':'OFF'}`;
-  if (MOCK_ON) {
-    try{
-      const res = await fetch('./mock.json?ts='+Date.now());
-      const data = await res.json();
-      const arr = Array.isArray(data) ? data : (Array.isArray(data.data)? data.data : []);
-      rawRows = [];
-      arr.forEach(x=>ingestRaw(x));
-      refreshRawTable();
-      log('INFO','已载入 Mock 数据', {count: arr.length});
-    }catch(e){
-      log('ERROR','Mock 加载失败', {e:String(e)});
-    }
-  } else {
-    log('INFO','Mock 已关闭');
-  }
-};
-
-/* =============== 启动信息 =============== */
-window.addEventListener('load', ()=>{
-  $('#buildInfo').textContent = `build=${window.__BUILD_SHA__ || 'dev'}`;
-  paintDot('raw','idle'); paintDot('pub','idle');
-  // 默认映射路径
-  $('#m_book').value = '/mappings/id/bookmakers.csv';
-  $('#m_league').value = '/mappings/id/leagues.csv';
-  $('#m_team').value = '/mappings/id/teams.csv';
-  $('#m_league_en').value = '/mappings/en/leagues_en2cn.csv';
-  $('#m_team_en').value = '/mappings/en/teams_en2cn.csv';
-});
+// 初次渲染（若页面有默认 Mock/数据，可自动渲染一次）
+renderRawTable();
+renderPubTable();
+addLog('INFO', 'F 端已就绪（app.js loaded）');
