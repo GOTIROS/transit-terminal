@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>F端 · 中转与发布（全WSS）</title>
+  <link rel="stylesheet" href="./styles.css?v=1" />
+</head>
+<body>
+<header class="topbar">
+  <h1>F端 · 中转与发布</h1>
+  <div class="status">
+    <span>原始流：</span><span id="rawDot" class="dot gray"></span><span id="rawText">未连接</span>
+    <span class="gap"></span>
+    <span>发布：</span><span id="pubDot" class="dot gray"></span><span id="pubText">未连接</span>
+    <span class="gap"></span>
+    <small id="buildInfo"></small>
+  </div>
+</header>
+
+<main class="container">
+  <!-- 原始流连接（Server → F） -->
+  <section class="card">
+    <h2>原始流连接（Server → F）</h2>
+    <div class="grid">
+      <label>原始 WSS URL
+        <input id="rawUrl" type="text" placeholder="wss://46.151.33.170/ws/raw" />
+      </label>
+      <label>Token（可选）
+        <input id="rawToken" type="text" placeholder="例如 token=xxx 或留空" />
+      </label>
+      <div class="row">
+        <button id="btnRawConnect" class="primary">连接原始流</button>
+        <button id="btnRawClose">断开</button>
+        <button id="btnToggleMock">切换 Mock（离线演示）</button>
+        <span id="mockBadge" class="badge">Mock: OFF</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 发布连接（F → /ws → A） -->
+  <section class="card">
+    <h2>发布连接（F → feed.youdatan.com/ws → A端）</h2>
+    <div class="grid">
+      <label>发布 WSS URL
+        <input id="pubUrl" type="text" placeholder="wss://feed.youdatan.com/ws" />
+      </label>
+      <label>PUBLISH_TOKEN（必填）
+        <input id="pubToken" type="text" placeholder="仅发布者需要" />
+      </label>
+      <div class="row">
+        <button id="btnPubConnect" class="primary">连接发布端点</button>
+        <button id="btnPubClose">断开</button>
+        <button id="btnPublishSnap">发布 Snapshot（全量）</button>
+        <button id="btnPublishBeat">发送 Heartbeat</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- 映射（CSV） -->
+  <section class="card">
+    <h2>映射（CSV，加载后用于汉化）</h2>
+    <div class="grid g3">
+      <label>bookmakers.csv
+        <input id="m_book" type="text" placeholder="/mappings/id/bookmakers.csv" />
+      </label>
+      <label>leagues.csv
+        <input id="m_league" type="text" placeholder="/mappings/id/leagues.csv" />
+      </label>
+      <label>teams.csv
+        <input id="m_team" type="text" placeholder="/mappings/id/teams.csv" />
+      </label>
+      <label>leagues_en2cn.csv
+        <input id="m_league_en" type="text" placeholder="/mappings/en/leagues_en2cn.csv" />
+      </label>
+      <label>teams_en2cn.csv
+        <input id="m_team_en" type="text" placeholder="/mappings/en/teams_en2cn.csv" />
+      </label>
+      <div class="row">
+        <button id="btnLoadMaps">加载/刷新映射</button>
+        <span id="mapStatus" class="muted">未加载</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 上表：原始数据 -->
+  <section class="card">
+    <h2>上表：原始数据（按 source 分 Tab）</h2>
+    <div class="tabs">
+      <button class="tab active" data-tab="all">全部(<span id="rawCount">0</span>)</button>
+      <button class="tab" data-tab="isp">ISP</button>
+      <button class="tab" data-tab="pm">PM</button>
+    </div>
+    <div class="table-wrap">
+      <table id="rawTable"><thead></thead><tbody></tbody></table>
+    </div>
+    <div class="row">
+      <button id="btnAllToPublish">将当前 Tab 全部加入下表候选</button>
+      <button id="btnClearRaw">清空原始</button>
+    </div>
+  </section>
+
+  <!-- 下表：发布表（筛选/汉化/导出） -->
+  <section class="card">
+    <h2>下表：发布表（筛选/汉化/导出）</h2>
+    <div class="grid g3">
+      <label>源
+        <select id="f_source">
+          <option value="">全部</option>
+          <option value="isp">isp</option>
+          <option value="pm">pm</option>
+        </select>
+      </label>
+      <label>盘口
+        <select id="f_market">
+          <option value="">全部</option>
+          <option value="ou">ou</option>
+          <option value="ah">ah</option>
+          <option value="1x2">1x2</option>
+          <option value="corners">corners</option>
+        </select>
+      </label>
+      <label>Period
+        <select id="f_period">
+          <option value="">全部</option>
+          <option value="FT">FT</option>
+          <option value="HT">HT</option>
+        </select>
+      </label>
+    </div>
+    <div class="row">
+      <button id="btnApplyFilter">应用筛选</button>
+      <button id="btnClearFilter">清空筛选</button>
+      <button id="btnClearPublish">清空下表</button>
+      <button id="btnDownloadJson">下载 export.json</button>
+    </div>
+    <div class="table-wrap">
+      <table id="pubTable"><thead></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+  <!-- 日志 -->
+  <section class="card">
+    <h2>日志</h2>
+    <div class="row">
+      <select id="logLevel">
+        <option>ALL</option><option>INFO</option><option>WARN</option><option>ERROR</option><option>DEBUG</option>
+      </select>
+      <button id="btnLogPause">暂停滚动</button>
+      <button id="btnLogClear">清空</button>
+      <button id="btnLogCopy">复制</button>
+      <button id="btnLogDownload">下载</button>
+    </div>
+    <pre id="logs" class="logs"></pre>
+  </section>
+</main>
+
+<script>window.__BUILD_SHA__="dev";</script>
+<script src="./app.js?v=1"></script>
+</body>
+</html>
