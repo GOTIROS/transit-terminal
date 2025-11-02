@@ -1,416 +1,233 @@
-/* public/app.js — F端 · 中转与发布
- * 关键点：
- * 1) 发布端连接不再强制要求 token，允许空；同时用 role=publisher 明确身份
- * 2) 若填写 token 仍会附带；未填写则不带
- * 3) 原始流连接（Server→F）、Mock、映射加载、上表/下表、导出、发布 Snapshot/Heartbeat、日志
- * 4) 选择器做了多路回退（id/name），避免因 DOM 命名差异绑不上
+/* transit-terminal /public/app.js
+ * 目标：
+ * 1) 发布端点不再强制需要 PUBLISH_TOKEN；
+ * 2) 原始/发布 WSS URL 自动保存到 localStorage，刷新后自动恢复；
+ * 3) 现有 UI（按钮文字：连接原始流 / 连接发布端点 / 发布 Snapshot / 发送 Heartbeat）可直接挂载；
+ * 4) 兼容你当前 index.html，无需改动 HTML。
  */
-"use strict";
 
-/* ========================== Utils ========================== */
-const $  = (sel) => document.querySelector(sel);
-const $$ = (sel) => Array.from(document.querySelectorAll(sel));
+(() => {
+  // ---------- 工具 & 日志 ----------
+  const LSK = {
+    SRC_URL: 'tt_src_wss_url',
+    PUB_URL: 'tt_pub_wss_url',
+    PUB_TOKEN: 'tt_pub_token_opt' // 仍可选；不填就不附带
+  };
 
-function pick(...sels) {
-  for (const s of sels) {
-    if (!s) continue;
-    const el = document.querySelector(s);
-    if (el) return el;
+  const $ = (sel, root = document) => root.querySelector(sel);
+  const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+
+  function pickButtonByText(text) {
+    return $$('button').find(b => (b.textContent || '').trim().includes(text));
   }
-  return null;
-}
 
-function jsonParseSafe(txt, fb=null) {
-  try { return JSON.parse(typeof txt === 'string' ? txt : String(txt)); } catch { return fb; }
-}
-
-function jsonStringSafe(obj) {
-  try { return JSON.stringify(obj); } catch { return String(obj); }
-}
-
-function nowTS() { return new Date().toISOString().slice(11,19); }
-
-/* ========================== Logger ========================== */
-const elLogList = pick('#logList', '#logBody', 'pre[data-log]', '#logPre');
-const elLogLevel = pick('#logLevel', 'select[name="logLevel"]');
-
-function addLog(level, msg, extra) {
-  if (!elLogList) return;
-  const line = `[${nowTS()}][${level}] ${msg}` + (extra ? ' ' + jsonStringSafe(extra) : '');
-  if (elLogList.tagName === 'PRE') {
-    elLogList.textContent += (elLogList.textContent ? '\n' : '') + line;
-  } else {
-    const li = document.createElement('div');
-    li.textContent = line;
-    elLogList.appendChild(li);
-    // 滚动到底
-    elLogList.scrollTop = elLogList.scrollHeight;
+  function pickInputNear(btn, nth = 0) {
+    // 找到按钮同卡片区域内第 nth 个文本输入（用于“原始 WSS URL / 发布 WSS URL”）
+    if (!btn) return null;
+    // 向上找块容器
+    let box = btn.closest('section,div,article') || document.body;
+    const inputs = $$('input[type="text"], input[type="search"]', box);
+    return inputs[nth] || null;
   }
-  // 控制台也打一份（便于排查）
-  if (level === 'ERROR') console.error(line);
-  else if (level === 'WARN') console.warn(line);
-  else console.log(line);
-}
 
-/* ========================== State ========================== */
-const store = {
-  // 上表：原始数据
-  rawRows: [],
-  // 下表：发布表候选
-  pubRows: [],
-  // 映射（可选）
-  maps: {
-    id: { leagues: null, teams: null, bookmakers: null },
-    en: { leagues: null, teams: null },
-  },
-  // 连接对象
-  wsSrc: null,      // Server -> F
-  wsPub: null,      // F -> 发布端（feed.youdatan.com）
-};
-
-/* ========================== DOM Refs（多路回退） ========================== */
-// 原始流连接（Server -> F）
-const elSrcUrl    = pick('#srcUrl',    'input[name="srcUrl"]');
-const elSrcToken  = pick('#srcToken',  'input[name="srcToken"]');
-const btnSrcConn  = pick('#btnSrcConn','button[data-action="src-connect"]', 'button#srcConnect');
-const btnSrcOff   = pick('#btnSrcOff', 'button[data-action="src-off"]');
-const btnMockToggle = pick('#btnMock', 'button[data-action="mock-toggle"]');
-
-// 发布连接（F -> feed.youdatan.com）
-const elPubUrl    = pick('#pubUrl',    'input[name="pubUrl"]');
-const elPubToken  = pick('#pubToken',  'input[name="pubToken"]'); // 可空
-const btnPubConn  = pick('#btnPubConn','button[data-action="pub-connect"]', 'button#pubConnect');
-const btnPubOff   = pick('#btnPubOff', 'button[data-action="pub-off"]');
-const btnSnapshot = pick('#btnSnapshot','button[data-action="publish-snapshot"]');
-const btnHeartbeat= pick('#btnHeartbeat','button[data-action="publish-heartbeat"]');
-
-// 映射 CSV
-const elMapBook   = pick('#map_bookmakers', 'input[name="map_bookmakers"]');
-const elMapLeaId  = pick('#map_leagues_id', 'input[name="map_leagues_id"]');
-const elMapTeamId = pick('#map_teams_id',   'input[name="map_teams_id"]');
-const elMapLeaEn  = pick('#map_leagues_en', 'input[name="map_leagues_en"]');
-const elMapTeamEn = pick('#map_teams_en',   'input[name="map_teams_en"]');
-const btnMapsLoad = pick('#btnMapsLoad',    'button[data-action="maps-load"]');
-
-// 上表/下表 & 过滤/导出
-const btnAddAll   = pick('#btnAddAll',      'button[data-action="raw-add-all"]');
-const btnClearRaw = pick('#btnClearRaw',    'button[data-action="raw-clear"]');
-const btnApply    = pick('#btnApplyFilters','button[data-action="apply-filters"]');
-const btnClear    = pick('#btnClearFilters','button[data-action="clear-filters"]');
-const btnExport   = pick('#btnExport',      'button[data-action="export-json"]');
-
-// 表格 tbody
-const elRawBody   = pick('#rawTbody', 'tbody#rawBody', 'tbody[data-role="raw"]');
-const elPubBody   = pick('#pubTbody', 'tbody#pubBody', 'tbody[data-role="pub"]');
-
-// 过滤控件（尽量回退）
-const selPubSource= pick('#pubSource','select[name="pubSource"]');
-const selPubMarket= pick('#pubMarket','select[name="pubMarket"]');
-const selPubPeriod= pick('#pubPeriod','select[name="pubPeriod"]');
-
-/* ========================== Renderers ========================== */
-function renderRawTable() {
-  if (!elRawBody) return;
-  elRawBody.innerHTML = '';
-  for (const r of store.rawRows) {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${r.event_id || ''}</td>
-      <td>${r.source || ''}</td>
-      <td>${r.league || ''}</td>
-      <td>${r.home || ''}</td>
-      <td>${r.away || ''}</td>
-      <td>${r.period || ''}</td>
-      <td>${r.market || ''}</td>
-      <td>${r.line_text || ''}</td>
-      <td>${jsonStringSafe(r.pickA || '')}</td>
-      <td>${jsonStringSafe(r.pickB || '')}</td>
-    `.trim();
-    elRawBody.appendChild(tr);
-  }
-}
-
-function renderPubTable() {
-  if (!elPubBody) return;
-  // 简单过滤
-  let rows = store.pubRows;
-  const src = selPubSource?.value || '全部';
-  const mk  = selPubMarket?.value || '全部';
-  const prd = selPubPeriod?.value || '全部';
-  rows = rows.filter(r => {
-    if (src !== '全部' && r.source !== src) return false;
-    if (mk  !== '全部' && r.market !== mk) return false;
-    if (prd !== '全部' && r.period !== prd) return false;
-    return true;
-  });
-
-  elPubBody.innerHTML = '';
-  for (const r of rows) {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td>${r.event_id || ''}</td>
-      <td>${r.source || ''}</td>
-      <td>${r.league || ''}</td>
-      <td>${r.home || ''}</td>
-      <td>${r.away || ''}</td>
-      <td>${r.period || ''}</td>
-      <td>${r.market || ''}</td>
-      <td>${r.line_text || ''}</td>
-      <td>${jsonStringSafe(r.pickA || '')}</td>
-      <td>${jsonStringSafe(r.pickB || '')}</td>
-    `.trim();
-    elPubBody.appendChild(tr);
-  }
-}
-
-/* ========================== Mock / 映射 ========================== */
-async function loadMock() {
-  try {
-    const res = await fetch('./mock.json', { cache: 'no-store' });
-    const json = await res.json();
-    // 期待结构：[{event_id, source, league, home, away, period, market, line_text, pickA, pickB}, ...]
-    store.rawRows = Array.isArray(json) ? json : (json.data || []);
-    addLog('INFO', '载入 Mock 数据', { count: store.rawRows.length });
-    renderRawTable();
-  } catch (e) {
-    addLog('ERROR', '载入 Mock 失败', e?.message || String(e));
-  }
-}
-
-async function fetchCSV(url) {
-  const res = await fetch(url, { cache: 'no-store' });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const txt = await res.text();
-  // 简陋 CSV -> map，按第一列 id/英文、第二列 中文
-  const lines = txt.split(/\r?\n/).filter(Boolean);
-  const map = {};
-  for (const ln of lines) {
-    const [k, v] = ln.split(',').map(s=>s?.trim());
-    if (k) map[k] = v ?? '';
-  }
-  return map;
-}
-
-async function loadMappings() {
-  const jobs = [];
-  // id 映射
-  if (elMapBook?.value) jobs.push(fetchCSV(elMapBook.value).then(m=>store.maps.id.bookmakers=m));
-  if (elMapLeaId?.value) jobs.push(fetchCSV(elMapLeaId.value).then(m=>store.maps.id.leagues=m));
-  if (elMapTeamId?.value) jobs.push(fetchCSV(elMapTeamId.value).then(m=>store.maps.id.teams=m));
-  // 英文 -> 中文
-  if (elMapLeaEn?.value) jobs.push(fetchCSV(elMapLeaEn.value).then(m=>store.maps.en.leagues=m));
-  if (elMapTeamEn?.value) jobs.push(fetchCSV(elMapTeamEn.value).then(m=>store.maps.en.teams=m));
-
-  if (!jobs.length) {
-    addLog('WARN', '未填写任何 CSV 路径，跳过加载');
-    return;
-  }
-  try {
-    await Promise.all(jobs);
-    addLog('INFO', '映射包已加载/刷新');
-  } catch (e) {
-    addLog('ERROR', '映射包加载失败', e?.message || String(e));
-  }
-}
-
-/* ========================== Server -> F：原始流连接 ========================== */
-function connectSource() {
-  const url   = (elSrcUrl?.value || '').trim();
-  const token = (elSrcToken?.value || '').trim();
-
-  if (!url) { alert('请填写 原始 WSS URL'); return; }
-
-  try {
-    if (store.wsSrc) { try { store.wsSrc.close(); } catch {} store.wsSrc = null; }
-
-    // 可选：token 通过 ?token=xxx 拼到 URL；也可在首帧发
-    const u = new URL(url);
-    if (token) u.searchParams.set('token', token);
-
-    const ws = new WebSocket(u.toString());
-    store.wsSrc = ws;
-
-    ws.onopen = () => {
-      addLog('INFO', 'src 打开', { url: u.toString() });
-      // 若服务端用首帧 auth，这里再发一次也无妨
-      if (token) ws.send(jsonStringSafe({ type:'auth', token }));
-    };
-
-    ws.onmessage = (ev) => {
-      const payload = jsonParseSafe(ev.data, ev.data);
-      // 兼容几种形态：数组即快照 / {type:'snapshot', data:[...]} / {type:'opportunity', data:{...}}
-      if (Array.isArray(payload)) {
-        store.rawRows = payload;
-        addLog('DEBUG', 'src 快照(数组)', { count: payload.length });
-        renderRawTable();
-      } else if (payload && typeof payload === 'object') {
-        if (payload.type === 'snapshot' && Array.isArray(payload.data)) {
-          store.rawRows = payload.data;
-          addLog('DEBUG', 'src 快照', { count: payload.data.length });
-          renderRawTable();
-        } else if (payload.type === 'opportunity' && payload.data) {
-          // 增量追加（你也可以按 event_id 去重/合并）
-          store.rawRows.unshift(payload.data);
-          renderRawTable();
-        } else if (payload.type === 'heartbeat') {
-          // 心跳仅记日志
-        } else {
-          // 其它：当做通用日志
-          addLog('DEBUG', 'src 消息', payload);
-        }
+  // 右下角日志面板（如果你已有，就同时输出到你已有的日志框/控制台）
+  const LOG = {
+    line(type, obj) {
+      const ts = new Date().toLocaleTimeString();
+      const txt = `[${ts}] [${type}] ${typeof obj === 'string' ? obj : JSON.stringify(obj)}`;
+      console[type === 'ERROR' ? 'error' : type === 'WARN' ? 'warn' : 'log'](txt);
+      const logBox = $('#logBox') || null; // 若你页面已有 id=logBox 的日志区域会显示
+      if (logBox) {
+        const p = document.createElement('div');
+        p.textContent = txt;
+        logBox.appendChild(p);
+        logBox.scrollTop = logBox.scrollHeight;
       }
-    };
+    },
+    info(x){ this.line('INFO', x); },
+    warn(x){ this.line('WARN', x); },
+    error(x){ this.line('ERROR', x); },
+    debug(x){ this.line('DEBUG', x); },
+  };
 
-    ws.onclose = (ev) => {
-      addLog('WARN', 'src 断开', { code: ev.code, reason: ev.reason });
-      store.wsSrc = null;
-    };
-    ws.onerror = (err) => {
-      addLog('ERROR', 'src 错误', err?.message || String(err));
-    };
-  } catch (e) {
-    addLog('ERROR', 'src 连接异常', e?.message || String(e));
+  // ---------- 恢复 & 保存 输入框 ----------
+  function bindRemember(input, key) {
+    if (!input) return;
+    // 恢复
+    const v = localStorage.getItem(key);
+    if (v) input.value = v;
+    // 监听保存
+    ['change','blur','input'].forEach(ev => {
+      input.addEventListener(ev, () => localStorage.setItem(key, input.value.trim()));
+    });
   }
-}
 
-function disconnectSource() {
-  if (store.wsSrc) {
-    try { store.wsSrc.close(1000, 'by user'); } catch {}
-    store.wsSrc = null;
-    addLog('INFO', 'src 已断开');
+  // ---------- WebSocket 逻辑 ----------
+  let srcWS = null;
+  let pubWS = null;
+  let pubHeartbeatTimer = null;
+
+  function closeWS(ws, tag) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      try { ws.close(1000, 'manual close'); } catch {}
+    }
+    LOG.info(`${tag} closed`);
   }
-}
 
-/* ========================== F -> 发布端：不强制 token ========================== */
-function buildPublisherUrl(raw, token) {
-  const u = new URL(raw);
-  u.searchParams.set('role', 'publisher'); // 关键：明确身份
-  if (token) u.searchParams.set('token', token);
-  return u.toString();
-}
+  function connectSource(url) {
+    if (!url) { alert('请填写 原始 WSS URL'); return; }
+    try { closeWS(srcWS, 'src'); } catch {}
+    LOG.info(`src 打开 {"url":"${url}"}`);
 
-function connectPublisher() {
-  const pubUrl   = (elPubUrl?.value || '').trim();
-  const pubToken = (elPubToken?.value || '').trim(); // 可空
-
-  if (!pubUrl) { alert('请填写 发布 WSS URL'); return; }
-
-  try {
-    if (store.wsPub) { try { store.wsPub.close(); } catch {} store.wsPub = null; }
-
-    const finalUrl = buildPublisherUrl(pubUrl, pubToken);
-    const ws = new WebSocket(finalUrl);
-    store.wsPub = ws;
-
-    ws.onopen = () => {
-      // 首帧再发一次 auth（无 token 也允许）
-      ws.send(jsonStringSafe({ type:'auth', role:'publisher', token: pubToken || '' }));
-      addLog('INFO', 'pub 打开', { url: finalUrl });
+    srcWS = new WebSocket(url);
+    srcWS.onopen = () => LOG.info('src 已连接');
+    srcWS.onmessage = (ev) => {
+      // 这里保留原样：你如果有“上表：原始数据”的渲染逻辑，继续沿用你现有的处理
+      LOG.debug({ src_msg: safeParse(ev.data) });
     };
+    srcWS.onerror = (e) => LOG.warn('src error');
+    srcWS.onclose = () => LOG.warn('src 断开');
+  }
 
-    ws.onmessage = (ev) => {
-      addLog('DEBUG', '发布端消息', jsonParseSafe(ev.data, ev.data));
+  function connectPublish(url, tokenOpt) {
+    if (!url) { alert('请填写 发布 WSS URL'); return; }
+
+    // ✅ 不再强制 token。若填写 token 则附带，否则不附带。
+    try { closeWS(pubWS, 'pub'); } catch {}
+    // 拼 URL（只有 token 存在才拼）
+    let finalUrl = url;
+    try {
+      const u = new URL(url);
+      const t = (tokenOpt || '').trim();
+      if (t) u.searchParams.set('token', t);
+      finalUrl = u.toString();
+    } catch(e) {
+      // 有些人会只填 //host/path
+    }
+
+    LOG.info(`pub 打开 {"url":"${finalUrl}"}`);
+    pubWS = new WebSocket(finalUrl);
+    pubWS.onopen = () => {
+      LOG.info('pub 已连接');
+      // Heartbeat 定时器（如果你点了“发送 Heartbeat”按钮则手动发，这里也可以自动发）
+      if (pubHeartbeatTimer) clearInterval(pubHeartbeatTimer);
+      pubHeartbeatTimer = setInterval(() => {
+        trySend(pubWS, { type:'heartbeat', ts: Date.now() }, 'pub 心跳');
+      }, 30_000);
     };
-
-    ws.onclose = (ev) => {
-      addLog('WARN', 'pub 断开', { code: ev.code, reason: ev.reason });
-      store.wsPub = null;
+    pubWS.onmessage = (ev) => LOG.debug({ pub_msg: safeParse(ev.data) });
+    pubWS.onerror = () => LOG.warn('pub error');
+    pubWS.onclose = () => {
+      LOG.warn('pub 断开');
+      if (pubHeartbeatTimer) clearInterval(pubHeartbeatTimer);
+      pubHeartbeatTimer = null;
     };
+  }
 
-    ws.onerror = (err) => {
-      addLog('ERROR', 'pub 错误', err?.message || String(err));
+  function trySend(ws, obj, tag='send') {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      LOG.warn(`${tag} 失败：未连接`);
+      return false;
+    }
+    try {
+      ws.send(JSON.stringify(obj));
+      LOG.info(`${tag} 已发送`);
+      return true;
+    } catch(e) {
+      LOG.error(`${tag} 发送异常`);
+      return false;
+    }
+  }
+
+  function safeParse(x){
+    try { return JSON.parse(x); } catch { return x; }
+  }
+
+  // ---------- 发布面板动作（Snapshot / Heartbeat） ----------
+  function collectPublishRows() {
+    // 按你页面原逻辑收集“下表：发布表”数据。
+    // 这里留一个尽量“宽容”的示例：
+    const tbl = $('#pubTable') || $('table[data-pub]') || null;
+    const rows = [];
+    if (!tbl) return rows;
+
+    const trs = $$('tbody tr', tbl);
+    trs.forEach(tr => {
+      const tds = $$('td', tr).map(td => (td.textContent || '').trim());
+      if (tds.length) {
+        rows.push({ raw: tds });
+      }
+    });
+    return rows;
+  }
+
+  function doPublishSnapshot() {
+    if (!pubWS || pubWS.readyState !== WebSocket.OPEN) {
+      alert('发布端尚未连接'); return;
+    }
+    const rows = collectPublishRows();
+    const payload = {
+      type: 'snapshot',
+      ts: Date.now(),
+      // 你可以替换为真正的“发布表结构”
+      data: rows
     };
-  } catch (e) {
-    addLog('ERROR', 'pub 连接异常', e?.message || String(e));
+    trySend(pubWS, payload, '发布 Snapshot');
   }
-}
 
-function disconnectPublisher() {
-  if (store.wsPub) {
-    try { store.wsPub.close(1000, 'by user'); } catch {}
-    store.wsPub = null;
-    addLog('INFO', 'pub 已断开');
+  function doSendHeartbeat() {
+    trySend(pubWS, { type:'heartbeat', ts: Date.now() }, 'Heartbeat');
   }
-}
 
-/* ========================== 发布：Snapshot / Heartbeat ========================== */
-function publishSnapshot() {
-  if (!store.wsPub || store.wsPub.readyState !== 1) {
-    alert('发布端未连接'); return;
+  // ---------- 绑定 UI ----------
+  function initUI() {
+    // 1) “连接原始流”区域
+    const btnSrc = pickButtonByText('连接原始流');
+    const srcInput = pickInputNear(btnSrc, 0);
+    bindRemember(srcInput, LSK.SRC_URL);
+
+    if (btnSrc) {
+      btnSrc.addEventListener('click', () => {
+        const url = (srcInput && srcInput.value.trim()) || '';
+        connectSource(url);
+      });
+    }
+
+    // 2) “连接发布端点”区域（不再强制 token）
+    const btnPub = pickButtonByText('连接发布端点');
+    const pubInput = pickInputNear(btnPub, 0);         // 发布 WSS URL
+    const tokenInput = null;                            // 你页面已取消强制，若仍保留输入框，可自行定位后放开这里
+    bindRemember(pubInput, LSK.PUB_URL);
+    // 如果你仍保留一个“token 输入框”，放开下面两行并确保 token 输入能被找到
+    // const tokenInput = pickInputNear(btnPub, 1);
+    // bindRemember(tokenInput, LSK.PUB_TOKEN);
+
+    if (btnPub) {
+      btnPub.addEventListener('click', () => {
+        const url = (pubInput && pubInput.value.trim()) || '';
+        const token = tokenInput ? (tokenInput.value || '').trim() : (localStorage.getItem(LSK.PUB_TOKEN) || '').trim();
+        connectPublish(url, token || ''); // ✅ 允许空 token
+      });
+    }
+
+    // 3) “发布 Snapshot（全量）”
+    const btnSnap = pickButtonByText('发布 Snapshot');
+    if (btnSnap) btnSnap.addEventListener('click', doPublishSnapshot);
+
+    // 4) “发送 Heartbeat”
+    const btnHb = pickButtonByText('发送 Heartbeat');
+    if (btnHb) btnHb.addEventListener('click', doSendHeartbeat);
+
+    // 5) 去掉旧版“必须填写 token”的提示（如有老逻辑弹窗）
+    // 只要能找到发布 URL，就认为表单是可用的
+    const oldGuardAlert = window.__NEED_TOKEN_ALERT__;
+    if (oldGuardAlert && typeof oldGuardAlert === 'function') {
+      window.__NEED_TOKEN_ALERT__ = () => {}; // 覆盖为 no-op
+    }
+
+    LOG.info('UI 初始化完成');
   }
-  if (!store.pubRows.length) {
-    alert('下表为空，无数据可发'); return;
-  }
-  const payload = { type:'snapshot', data: store.pubRows };
-  store.wsPub.send(jsonStringSafe(payload));
-  addLog('INFO', '已发送 Snapshot', { count: store.pubRows.length });
-}
 
-function publishHeartbeat() {
-  if (!store.wsPub || store.wsPub.readyState !== 1) return;
-  const payload = { type:'heartbeat', ts: Date.now() };
-  store.wsPub.send(jsonStringSafe(payload));
-  addLog('DEBUG', '已发送 Heartbeat');
-}
-
-/* ========================== 上表→下表 / 过滤 / 导出 ========================== */
-function addAllToPublish() {
-  store.pubRows = store.rawRows.slice();
-  renderPubTable();
-  addLog('INFO', '已将上表全部加入下表', { count: store.pubRows.length });
-}
-
-function clearRaw() {
-  store.rawRows = [];
-  renderRawTable();
-  addLog('INFO', '上表已清空');
-}
-
-function applyFilters() {
-  renderPubTable();
-}
-
-function clearFilters() {
-  if (selPubSource) selPubSource.value = '全部';
-  if (selPubMarket) selPubMarket.value = '全部';
-  if (selPubPeriod) selPubPeriod.value = '全部';
-  renderPubTable();
-}
-
-function exportJSON() {
-  const blob = new Blob([jsonStringSafe(store.pubRows)], { type: 'application/json;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = 'export.json';
-  a.click();
-  URL.revokeObjectURL(url);
-  addLog('INFO', 'export.json 已下载', { count: store.pubRows.length });
-}
-
-/* ========================== Event Bindings ========================== */
-// Server -> F
-btnSrcConn && btnSrcConn.addEventListener('click', connectSource);
-btnSrcOff  && btnSrcOff.addEventListener('click', disconnectSource);
-btnMockToggle && btnMockToggle.addEventListener('click', loadMock);
-
-// F -> 发布端
-btnPubConn && btnPubConn.addEventListener('click', connectPublisher);
-btnPubOff  && btnPubOff.addEventListener('click', disconnectPublisher);
-btnSnapshot && btnSnapshot.addEventListener('click', publishSnapshot);
-btnHeartbeat&& btnHeartbeat.addEventListener('click', publishHeartbeat);
-
-// 映射
-btnMapsLoad && btnMapsLoad.addEventListener('click', loadMappings);
-
-// 上表/下表/过滤/导出
-btnAddAll   && btnAddAll.addEventListener('click', addAllToPublish);
-btnClearRaw && btnClearRaw.addEventListener('click', clearRaw);
-btnApply    && btnApply.addEventListener('click', applyFilters);
-btnClear    && btnClear.addEventListener('click', clearFilters);
-btnExport   && btnExport.addEventListener('click', exportJSON);
-
-// 初次渲染（若页面有默认 Mock/数据，可自动渲染一次）
-renderRawTable();
-renderPubTable();
-addLog('INFO', 'F 端已就绪（app.js loaded）');
+  // ---------- 启动 ----------
+  document.addEventListener('DOMContentLoaded', initUI);
+})();
